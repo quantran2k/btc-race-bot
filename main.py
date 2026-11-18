@@ -11,7 +11,7 @@ MIN_NOTIONAL_RAW = 1_000_000  # 1 USDC
 
 
 class Strategy:
-    """Trend-following with ER chop filter, multi-horizon momentum confirmation, and ATR trailing stop."""
+    """Dual-regime strategy: trend-continuation breakout + oversold capitulation bounce."""
 
     def __init__(self, state):
         spec = state.symbols[SYMBOL]
@@ -25,8 +25,11 @@ class Strategy:
         self.ema_med = None
         self.ema_slow = None
         self.atr_bps = 0.0
+        self.avg_gain = 0.0
+        self.avg_loss = 0.0
 
         self.in_pos = False
+        self.mode = None  # "trend" or "reversion"
         self.entry_price = 0.0
         self.peak_price = 0.0
         self.entry_bar = -1
@@ -47,6 +50,28 @@ class Strategy:
         )
         return net / path if path > 0.0 else 0.0
 
+    def _rsi(self):
+        if self.avg_loss == 0.0:
+            return 100.0 if self.avg_gain > 0.0 else 50.0
+        rs = self.avg_gain / self.avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    def _size_order(self, state, target_frac, max_impact_bps):
+        depths = state.depth_at(SYMBOL)
+        depth = min(depths) if depths else 0
+        max_by_impact = (depth * max_impact_bps) // 10000 if depth > 0 else state.cash
+        budget = min(int(state.cash * target_frac), state.weight_room(SYMBOL), max_by_impact)
+        if budget < MIN_NOTIONAL_RAW:
+            return []
+        impact = state.impact_bps(SYMBOL, budget) or 0
+        slippage_cap = min(200, max(50, impact + 40))
+        return [{
+            "side": "buy",
+            "symbol": SYMBOL,
+            "notional_quote_units": str(budget),
+            "max_slippage_bps": slippage_cap,
+        }]
+
     def on_batch(self, state, batch):
         bar = next((b for b in batch.get("bars", []) if b["symbol"] == SYMBOL), None)
         if bar is None:
@@ -59,6 +84,16 @@ class Strategy:
 
         prev_close = self.closes[-1] if self.closes else close
         self.closes.append(close)
+
+        delta = close - prev_close
+        gain = delta if delta > 0.0 else 0.0
+        loss = -delta if delta < 0.0 else 0.0
+        if self.bar_idx == 0:
+            self.avg_gain = gain
+            self.avg_loss = loss
+        else:
+            self.avg_gain = (13.0 * self.avg_gain + gain) / 14.0
+            self.avg_loss = (13.0 * self.avg_loss + loss) / 14.0
 
         tr_bps = ((max(high, prev_close) - min(low, prev_close)) / prev_close) * 10000.0
         self.atr_bps = tr_bps if self.bar_idx == 0 else 0.95 * self.atr_bps + 0.05 * tr_bps
@@ -88,17 +123,24 @@ class Strategy:
             pnl_bps = ((close - self.entry_price) / self.entry_price) * 10000.0
             peak_pnl_bps = ((self.peak_price - self.entry_price) / self.entry_price) * 10000.0
 
-            if peak_pnl_bps >= 60.0:
-                stop_bps = max(35.0, min(70.0, 2.0 * self.atr_bps))
+            if self.mode == "reversion":
+                take_profit = pnl_bps >= 65.0 or (close >= self.ema_med and pnl_bps > 25.0)
+                hard_stop = pnl_bps < -50.0
+                time_stop = hold_bars >= 45 and pnl_bps < 20.0
+                should_exit = take_profit or hard_stop or time_stop
             else:
-                stop_bps = max(50.0, min(100.0, 3.0 * self.atr_bps))
+                if peak_pnl_bps >= 60.0:
+                    stop_bps = max(35.0, min(70.0, 2.0 * self.atr_bps))
+                else:
+                    stop_bps = max(50.0, min(100.0, 3.0 * self.atr_bps))
+                trend_broken = (self.ema_fast < self.ema_med * 0.9992) and hold_bars >= 10
+                hard_stop = pnl_bps < -60.0
+                trailing_hit = drawdown_from_peak_bps > stop_bps and hold_bars >= 5
+                should_exit = hard_stop or trailing_hit or trend_broken
 
-            trend_broken = (self.ema_fast < self.ema_med * 0.9992) and hold_bars >= 10
-            hard_stop = pnl_bps < -60.0
-            trailing_hit = drawdown_from_peak_bps > stop_bps and hold_bars >= 5
-
-            if hard_stop or trailing_hit or trend_broken:
+            if should_exit:
                 self.in_pos = False
+                self.mode = None
                 self.last_exit_bar = self.bar_idx
                 return [{
                     "side": "sell",
@@ -109,12 +151,15 @@ class Strategy:
             return []
 
         self.in_pos = False
-        if self.bar_idx - self.last_exit_bar < 20:
+        self.mode = None
+        if self.bar_idx - self.last_exit_bar < 15:
             return []
 
         er_30 = self._efficiency_ratio(30)
         ret_60_bps = ((close - self.closes[-61]) / self.closes[-61]) * 10000.0
+        dist_med_bps = ((close - self.ema_med) / self.ema_med) * 10000.0
         slow_rising = self.ema_slow > self.ema_slow_hist[-11]
+
         trend_up = (
             slow_rising
             and ret_60_bps > 25.0
@@ -122,22 +167,19 @@ class Strategy:
             and self.ema_med > self.ema_slow
             and close > self.ema_med
         )
-        dist_med_bps = ((close - self.ema_med) / self.ema_med) * 10000.0
 
         if trend_up and er_30 > 0.32 and 0.0 < dist_med_bps < 55.0:
-            depths = state.depth_at(SYMBOL)
-            depth = min(depths) if depths else 0
-            max_by_impact = (depth * 6) // 10000 if depth > 0 else state.cash
-            budget = min(int(state.cash * 0.98), state.weight_room(SYMBOL), max_by_impact)
-            if budget >= MIN_NOTIONAL_RAW:
-                impact = state.impact_bps(SYMBOL, budget) or 0
-                slippage_cap = min(200, max(50, impact + 40))
-                return [{
-                    "side": "buy",
-                    "symbol": SYMBOL,
-                    "notional_quote_units": str(budget),
-                    "max_slippage_bps": slippage_cap,
-                }]
+            self.mode = "trend"
+            if er_30 > 0.38 and ret_60_bps > 40.0:
+                return self._size_order(state, 0.98, 12)
+            return self._size_order(state, 0.90, 9)
+
+        # Oversold capitulation bounce: sharp drop + extreme RSI + first stabilization tick
+        rsi = self._rsi()
+        ret_30_bps = ((close - self.closes[-31]) / self.closes[-31]) * 10000.0
+        if rsi < 24.0 and ret_30_bps < -75.0 and dist_med_bps < -65.0 and close > prev_close:
+            self.mode = "reversion"
+            return self._size_order(state, 0.65, 8)
 
         return []
 
